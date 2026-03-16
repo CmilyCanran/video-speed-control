@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         视频倍速播放控制
 // @namespace    https://github.com/cmilycanran
-// @version      1.6.1
+// @version      1.7.2
 // @description  视频倍速循环播放控制，支持快捷键切换和自定义倍速列表
 // @icon        data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="%234FC3F7"><path d="M8 5v14l11-7z"/></svg>
 // @license      MIT
@@ -155,7 +155,8 @@
                 initVisible: get('initVisible', true),
                 showOnPause: get('showOnPause', false),
                 pauseFade: get('pauseFade', false),
-                pauseFadeDelay: get('pauseFadeDelay', String(CONSTANTS.PAUSE_FADE_DELAY_DEFAULT), v => parseInt(v))
+                pauseFadeDelay: get('pauseFadeDelay', String(CONSTANTS.PAUSE_FADE_DELAY_DEFAULT), v => parseInt(v)),
+                enableControlBar: get('enableControlBar', true)
             };
         }
 
@@ -269,6 +270,15 @@
         setPauseFadeDelay(delay) {
             this.config.pauseFadeDelay = delay;
             GM_setValue(PREFIX + 'pauseFadeDelay', delay);
+        }
+
+        isEnableControlBar() {
+            return this.config.enableControlBar;
+        }
+
+        setEnableControlBar(enabled) {
+            this.config.enableControlBar = enabled;
+            GM_setValue(PREFIX + 'enableControlBar', enabled);
         }
     }
 
@@ -716,6 +726,14 @@
                     </div>
                     <div class="vss-settings-section">
                         <div class="vss-settings-row">
+                            <label>
+                                <input type="checkbox" id="vss-enable-control-bar" ${this.configManager.isEnableControlBar() ? 'checked' : ''}>
+                                启用视频控制栏倍速按钮
+                            </label>
+                        </div>
+                    </div>
+                    <div class="vss-settings-section">
+                        <div class="vss-settings-row">
                             <label>快捷键说明:</label>
                             <div class="vss-help-text">
                                 <p><kbd>~</kbd> 循环切换倍速</p>
@@ -892,6 +910,18 @@
                 }
             });
 
+            // 控制栏按钮开关
+            panel.querySelector('#vss-enable-control-bar').addEventListener('change', (e) => {
+                this.configManager.setEnableControlBar(e.target.checked);
+                
+                // 通知 SpeedManager 更新控制栏注入器
+                if (window._vss_manager_) {
+                    window._vss_manager_.updateControlBarInjector();
+                }
+                
+                showNotification(e.target.checked ? '已开启控制栏倍速按钮' : '已关闭控制栏倍速按钮');
+            });
+
             panel.addEventListener('click', (e) => {
                 e.stopPropagation();
             });
@@ -950,6 +980,310 @@
         }
     }
 
+    // ==================== 视频控制栏注入器 ====================
+    class VideoControlBarInjector {
+        constructor(configManager, speedController, speedUI) {
+            this.configManager = configManager;
+            this.speedController = speedController;
+            this.speedUI = speedUI;
+            this.injectedVideos = new WeakSet();
+            this.observers = [];
+            this.enabled = configManager.isEnableControlBar();
+        }
+
+        init() {
+            this._setupConfigSync();
+            this._observeVideos();
+        }
+
+        setEnabled(enabled) {
+            this.enabled = enabled;
+            
+            // 禁用时隐藏已注入的控件
+            if (!enabled) {
+                document.querySelectorAll('.vss-bar-controls').forEach(el => {
+                    el.style.display = 'none';
+                });
+            } else {
+                // 启用时显示控件
+                document.querySelectorAll('.vss-bar-controls').forEach(el => {
+                    el.style.display = '';
+                });
+            }
+        }
+
+        _setupConfigSync() {
+            const originalSetSpeedList = this.configManager.setSpeedList.bind(this.configManager);
+            this.configManager.setSpeedList = (list) => {
+                originalSetSpeedList(list);
+                this._refreshAllDropdowns();
+            };
+
+            const originalNextSpeed = this.configManager.nextSpeed.bind(this.configManager);
+            this.configManager.nextSpeed = () => {
+                const result = originalNextSpeed();
+                this._updateAllButtons();
+                return result;
+            };
+
+            const originalSetCurrentIndex = this.configManager.setCurrentIndex.bind(this.configManager);
+            this.configManager.setCurrentIndex = (index) => {
+                originalSetCurrentIndex(index);
+                this._updateAllButtons();
+            };
+
+            const originalSetLocked = this.configManager.setLocked.bind(this.configManager);
+            this.configManager.setLocked = (locked) => {
+                originalSetLocked(locked);
+                this._updateAllLockStates();
+            };
+        }
+
+        _observeVideos() {
+            const processVideo = (video) => {
+                if (!this.enabled) return;
+                if (!video || !(video instanceof HTMLVideoElement)) return;
+                if (this.injectedVideos.has(video)) return;
+                
+                this.injectedVideos.add(video);
+                this._createControl(video);
+            };
+
+            const checkAndInject = () => {
+                document.querySelectorAll('video').forEach(processVideo);
+                document.querySelectorAll('*').forEach(el => {
+                    if (el.shadowRoot) {
+                        el.shadowRoot.querySelectorAll('video').forEach(processVideo);
+                    }
+                });
+            };
+
+            checkAndInject();
+
+            const observer = new MutationObserver(() => {
+                checkAndInject();
+            });
+
+            this.observers.push(observer);
+
+            if (document.body) {
+                observer.observe(document.body, {
+                    childList: true,
+                    subtree: true
+                });
+            } else {
+                document.addEventListener('DOMContentLoaded', () => {
+                    observer.observe(document.body, {
+                        childList: true,
+                        subtree: true
+                    });
+                });
+            }
+
+            document.addEventListener('vss-shadow-root-created', (e) => {
+                const shadowRoot = e.detail?.shadowRoot;
+                if (shadowRoot) {
+                    shadowRoot.querySelectorAll('video').forEach(processVideo);
+                }
+            });
+
+            window.addEventListener('beforeunload', () => {
+                observer.disconnect();
+            });
+        }
+
+        _createControl(video) {
+            let container = video.parentElement;
+            if (!container) return;
+
+            let wrapper = container.closest('.vss-video-wrapper');
+            if (!wrapper) {
+                wrapper = document.createElement('div');
+                wrapper.className = 'vss-video-wrapper';
+                wrapper.style.cssText = 'position: relative; display: inline-block; max-width: 100%;';
+                
+                if (container.parentElement) {
+                    container.parentElement.insertBefore(wrapper, container);
+                    wrapper.appendChild(container);
+                } else {
+                    return;
+                }
+            }
+
+            if (wrapper.querySelector('.vss-bar-controls')) return;
+
+            const controls = document.createElement('div');
+            controls.className = 'vss-bar-controls';
+            controls.innerHTML = `
+                <div class="vss-speed-dropdown">
+                    <button class="vss-speed-btn">${this.configManager.getCurrentSpeed()}x</button>
+                    <div class="vss-speed-menu">
+                        ${this.configManager.getSpeedList().map(speed => `
+                            <div class="vss-speed-option" data-speed="${speed}">${speed}x</div>
+                        `).join('')}
+                    </div>
+                </div>
+            `;
+
+            wrapper.appendChild(controls);
+            this._bindEvents(controls, video, wrapper);
+            this._bindDropdownEvents(controls, video, wrapper);
+        }
+
+        _bindEvents(controls, video, wrapper) {
+            const showControls = () => {
+                controls.classList.add('vss-bar-visible');
+            };
+
+            const hideControls = () => {
+                const menu = controls.querySelector('.vss-speed-menu');
+                if (!menu.classList.contains('vss-speed-menu-open')) {
+                    controls.classList.remove('vss-bar-visible');
+                }
+            };
+
+            wrapper.addEventListener('mouseenter', showControls);
+            wrapper.addEventListener('mouseleave', hideControls);
+            video.addEventListener('mousemove', showControls);
+
+            let hideTimer = null;
+            video.addEventListener('mouseout', () => {
+                hideTimer = setTimeout(hideControls, 1000);
+            });
+            video.addEventListener('mouseover', () => {
+                if (hideTimer) clearTimeout(hideTimer);
+            });
+
+            document.addEventListener('visibilitychange', () => {
+                if (document.hidden) {
+                    controls.classList.add('vss-bar-visible');
+                }
+            });
+        }
+
+        _bindDropdownEvents(container, video, wrapper) {
+            const btn = container.querySelector('.vss-speed-btn');
+            const menu = container.querySelector('.vss-speed-menu');
+            const options = menu.querySelectorAll('.vss-speed-option');
+            let closeTimer = null;
+
+            const closeMenuAndHide = () => {
+                menu.classList.remove('vss-speed-menu-open');
+                clearCloseTimer();
+                if (!wrapper.matches(':hover') && !video.matches(':hover')) {
+                    container.classList.remove('vss-bar-visible');
+                }
+            };
+
+            const startCloseTimer = () => {
+                this._clearCloseTimer();
+                closeTimer = setTimeout(() => {
+                    closeMenuAndHide();
+                }, 5000);
+            };
+
+            const clearCloseTimer = () => {
+                if (closeTimer) {
+                    clearTimeout(closeTimer);
+                    closeTimer = null;
+                }
+            };
+
+            this._clearCloseTimer = clearCloseTimer;
+
+            btn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                if (menu.classList.contains('vss-speed-menu-open')) {
+                    closeMenuAndHide();
+                } else {
+                    this._closeAllMenus();
+                    menu.classList.add('vss-speed-menu-open');
+                    startCloseTimer();
+                }
+            });
+
+            options.forEach(option => {
+                option.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    const speed = parseFloat(option.dataset.speed);
+                    const index = this.configManager.getSpeedList().indexOf(speed);
+                    this.configManager.setCurrentIndex(index);
+                    this.speedController.setPlaybackRate(speed);
+                    this._updateButtonText(btn);
+                    this._updateOptionStates(menu);
+                    closeMenuAndHide();
+                });
+                
+                option.addEventListener('mouseenter', () => {
+                    if (menu.classList.contains('vss-speed-menu-open')) {
+                        startCloseTimer();
+                    }
+                });
+            });
+
+            btn.addEventListener('mouseenter', () => {
+                if (menu.classList.contains('vss-speed-menu-open')) {
+                    startCloseTimer();
+                }
+            });
+
+            document.addEventListener('click', (e) => {
+                if (!container.contains(e.target)) {
+                    closeMenuAndHide();
+                }
+            });
+
+            this._updateOptionStates(menu);
+        }
+
+        _updateButtonText(btn) {
+            if (btn) {
+                btn.textContent = `${this.configManager.getCurrentSpeed()}x`;
+            }
+        }
+
+        _updateOptionStates(menu) {
+            if (!menu) return;
+            const currentSpeed = this.configManager.getCurrentSpeed();
+            menu.querySelectorAll('.vss-speed-option').forEach(option => {
+                const speed = parseFloat(option.dataset.speed);
+                option.classList.toggle('active', speed === currentSpeed);
+            });
+        }
+
+        _updateAllButtons() {
+            document.querySelectorAll('.vss-speed-btn').forEach(btn => {
+                this._updateButtonText(btn);
+            });
+            document.querySelectorAll('.vss-speed-menu').forEach(menu => {
+                this._updateOptionStates(menu);
+            });
+        }
+
+        _updateAllLockStates() {}
+
+        _refreshAllDropdowns() {
+            document.querySelectorAll('.vss-speed-dropdown').forEach(container => {
+                const menu = container.querySelector('.vss-speed-menu');
+                const btn = container.querySelector('.vss-speed-btn');
+                if (menu && btn) {
+                    menu.innerHTML = this.configManager.getSpeedList().map(speed => `
+                        <div class="vss-speed-option" data-speed="${speed}">${speed}x</div>
+                    `).join('');
+                    
+                    const video = this.speedController.getActivePlayer();
+                    this._bindDropdownEvents(container, video);
+                }
+            });
+        }
+
+        _closeAllMenus() {
+            document.querySelectorAll('.vss-speed-menu-open').forEach(menu => {
+                menu.classList.remove('vss-speed-menu-open');
+            });
+        }
+    }
+
     // ==================== 主控制器 ====================
     class SpeedManager {
         constructor() {
@@ -958,6 +1292,7 @@
             this.speedController = new SpeedController(this.configManager, this.speedUI);
             this.speedUI.speedController = this.speedController;
             this.autoCheckTimer = null;
+            this.controlBarInjector = null;
         }
 
         init() {
@@ -966,10 +1301,30 @@
             this.speedController.hijackPlaybackRate();
             this.speedController.bindVideoPauseEvents();
             this.speedUI.init();
+            this._initControlBarInjector();
             this._bindKeyEvents();
             this._setupResizeObserver();
             this._setupVideoObserver();
             this._setupAutoCheck();
+        }
+
+        _initControlBarInjector() {
+            if (!this.configManager.isEnableControlBar()) return;
+            
+            this.controlBarInjector = new VideoControlBarInjector(
+                this.configManager,
+                this.speedController,
+                this.speedUI
+            );
+            this.controlBarInjector.init();
+        }
+
+        updateControlBarInjector() {
+            if (this.controlBarInjector) {
+                this.controlBarInjector.setEnabled(this.configManager.isEnableControlBar());
+            } else if (this.configManager.isEnableControlBar()) {
+                this._initControlBarInjector();
+            }
         }
 
         // 自动检查倍速
@@ -1335,6 +1690,82 @@
                     gap: 8px;
                     color: #aaa;
                     font-size: 13px;
+                }
+
+                /* 视频控制栏倍速下拉菜单 */
+                .vss-bar-controls {
+                    position: absolute;
+                    top: 10px;
+                    left: 10px;
+                    z-index: 99999;
+                    opacity: 0;
+                    visibility: hidden;
+                    transition: opacity 0.3s ease, visibility 0.3s ease;
+                }
+
+                .vss-bar-controls.vss-bar-visible {
+                    opacity: 1;
+                    visibility: visible;
+                }
+
+                .vss-speed-dropdown {
+                    position: relative;
+                    display: inline-flex;
+                    vertical-align: middle;
+                }
+
+                .vss-speed-btn {
+                    background: rgba(0, 0, 0, 0.7);
+                    border: none;
+                    color: white;
+                    padding: 4px 10px;
+                    border-radius: 4px;
+                    cursor: pointer;
+                    font-size: 13px;
+                    font-family: inherit;
+                    transition: background 0.2s;
+                }
+
+                .vss-speed-btn:hover {
+                    background: rgba(0, 0, 0, 0.85);
+                }
+
+                .vss-speed-menu {
+                    position: absolute;
+                    top: 100%;
+                    left: 50%;
+                    transform: translateX(-50%);
+                    background: rgba(0, 0, 0, 0.9);
+                    border-radius: 6px;
+                    padding: 4px 0;
+                    min-width: 60px;
+                    display: none;
+                    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.4);
+                    z-index: 999999;
+                    margin-top: 4px;
+                }
+
+                .vss-speed-menu.vss-speed-menu-open {
+                    display: block;
+                }
+
+                .vss-speed-option {
+                    padding: 6px 14px;
+                    cursor: pointer;
+                    font-size: 13px;
+                    color: #e0e0e0;
+                    text-align: center;
+                    transition: background 0.15s;
+                    white-space: nowrap;
+                }
+
+                .vss-speed-option:hover {
+                    background: rgba(79, 195, 247, 0.3);
+                }
+
+                .vss-speed-option.active {
+                    color: #4fc3f7;
+                    font-weight: 600;
                 }
             `;
 
