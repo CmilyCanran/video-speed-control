@@ -1,0 +1,10 @@
+# 开发依赖
+node_modules
+package-lock.json
+.jshintrc
+.eslintrc*
+
+# 日志和系统文件
+*.log
+.DS_Store
+/AGENTS.md
